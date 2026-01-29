@@ -42,6 +42,12 @@ while getopts "u:s:m:t:h" opt; do
     esac
 done
 
+# Validate TIMEOUT_MINUTES is a positive integer
+if ! [[ "$TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] || [ "$TIMEOUT_MINUTES" -le 0 ]; then
+    echo -e "${RED}❌ Invalid timeout: must be a positive integer${NC}"
+    exit 1
+fi
+
 # Prompt for server if not provided
 if [ -z "$REMOTE_HOST" ]; then
     echo -e "${YELLOW}No server specified.${NC}"
@@ -64,37 +70,39 @@ if ! command -v ollama &> /dev/null; then
     exit 1
 fi
 
-# Check if model exists
+# Get Ollama PID (ollama list above will have started it if it wasn't running)
+OLLAMA_PID=$(pgrep -x ollama)
+OLLAMA_STARTED_BY_US=false
+
+if [ -z "$OLLAMA_PID" ]; then
+    # Ollama not running, start it ourselves
+    echo -e "${YELLOW}📦 Starting Ollama...${NC}"
+    OLLAMA_HOST=0.0.0.0:11434 OLLAMA_ORIGINS="*" ollama serve > /tmp/ollama.log 2>&1 &
+    OLLAMA_PID=$!
+    OLLAMA_STARTED_BY_US=true
+    sleep 3
+
+    if ! kill -0 $OLLAMA_PID 2>/dev/null; then
+        echo -e "${RED}❌ Ollama failed to start. Check /tmp/ollama.log${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}✅ Ollama already running (PID: $OLLAMA_PID)${NC}"
+fi
+
+# Check if model exists (this will start Ollama if not running)
 echo -e "${YELLOW}📦 Checking if model ${OLLAMA_MODEL} is available...${NC}"
 if ! ollama list | grep -q "${OLLAMA_MODEL}"; then
     echo -e "${YELLOW}⬇️  Model not found. Pulling ${OLLAMA_MODEL}...${NC}"
     ollama pull "${OLLAMA_MODEL}"
 fi
 
-# Kill any existing Ollama processes
-echo -e "${YELLOW}🛑 Stopping any existing Ollama instances...${NC}"
-pkill ollama 2>/dev/null
-sleep 2
-
-# Start Ollama with proper config
-echo -e "${YELLOW}📦 Starting Ollama...${NC}"
-export OLLAMA_HOST=0.0.0.0:11434
-export OLLAMA_ORIGINS="*"
-OLLAMA_HOST=0.0.0.0:11434 OLLAMA_ORIGINS="*" ollama serve > /tmp/ollama.log 2>&1 &
-sleep 3
-
-# Get the actual Ollama PID
-OLLAMA_PID=$(pgrep -f "ollama serve" | head -n 1)
-
-if [ -z "$OLLAMA_PID" ]; then
-    echo -e "${RED}❌ Ollama failed to start. Check /tmp/ollama.log${NC}"
-    exit 1
-fi
-
-# Verify Ollama is running
+# Verify Ollama is responding
 if ! curl -s http://localhost:11434/api/tags > /dev/null; then
-    echo -e "${RED}❌ Ollama not responding. Check /tmp/ollama.log${NC}"
-    kill $OLLAMA_PID 2>/dev/null
+    echo -e "${RED}❌ Ollama not responding${NC}"
+    if [ "$OLLAMA_STARTED_BY_US" = true ]; then
+        kill $OLLAMA_PID 2>/dev/null
+    fi
     exit 1
 fi
 echo -e "${GREEN}✅ Ollama is running (PID: $OLLAMA_PID)${NC}"
@@ -115,7 +123,7 @@ echo -e "${GREEN}✅ SSH tunnel established (PID: $SSH_PID)${NC}"
 
 # Start socat on remote server
 echo -e "${YELLOW}🔀 Starting socat relay on remote server...${NC}"
-ssh ${REMOTE_USER}@${REMOTE_HOST} "pkill socat; nohup socat TCP-LISTEN:11434,fork,bind=10.0.0.1 TCP:127.0.0.1:11434 > /tmp/socat.log 2>&1 &"
+REMOTE_SOCAT_PID=$(ssh ${REMOTE_USER}@${REMOTE_HOST} "nohup socat TCP-LISTEN:11434,fork,bind=10.0.0.1 TCP:127.0.0.1:11434 > /tmp/socat.log 2>&1 & echo \$!")
 sleep 2
 
 # Test the connection from remote server
@@ -155,6 +163,7 @@ echo ""
 
 # Cleanup function
 cleanup() {
+    trap - INT TERM EXIT
     echo ""
     echo -e "${YELLOW}🛑 Cleaning up...${NC}"
 
@@ -163,15 +172,19 @@ cleanup() {
 
     # Stop socat on remote
     echo -e "${YELLOW}   Stopping socat on remote server...${NC}"
-    ssh ${REMOTE_USER}@${REMOTE_HOST} "pkill socat" 2>/dev/null
+    ssh ${REMOTE_USER}@${REMOTE_HOST} "kill $REMOTE_SOCAT_PID" 2>/dev/null
 
     # Kill SSH tunnel
     echo -e "${YELLOW}   Closing SSH tunnel...${NC}"
     kill $SSH_PID 2>/dev/null
 
-    # Kill Ollama
-    echo -e "${YELLOW}   Stopping Ollama...${NC}"
-    kill $OLLAMA_PID 2>/dev/null
+    # Kill Ollama only if we started it
+    if [ "$OLLAMA_STARTED_BY_US" = true ]; then
+        echo -e "${YELLOW}   Stopping Ollama...${NC}"
+        kill $OLLAMA_PID 2>/dev/null
+    else
+        echo -e "${YELLOW}   Leaving Ollama running (was already running)${NC}"
+    fi
 
     echo ""
     echo -e "${GREEN}✅ Cleanup complete!${NC}"
